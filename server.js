@@ -8,12 +8,61 @@ require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
+
+// Расширенная конфигурация CORS для поддержки множественных origins
+const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || 
+  process.env.CORS_ORIGIN?.split(',').map(o => o.trim()) || [
+    'https://chattify.site',
+    'https://www.chattify.site',
+    'https://chattify.space',
+    'https://www.chattify.space',
+    'https://ws.chattify.site',
+    'http://localhost:3000',
+    'http://localhost:3001'
+  ];
+
+console.log('🔗 Разрешенные домены для CORS:', allowedOrigins);
+
 const io = socketIo(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || "http://localhost:3000",
-    methods: ["GET", "POST"],
+    origin: (origin, callback) => {
+      // Разрешаем запросы без origin (например, мобильные приложения, Postman)
+      if (!origin) {
+        console.log('⚠️ Request without origin, allowing');
+        return callback(null, true);
+      }
+      
+      console.log('🔍 CORS check for origin:', origin);
+      
+      // Проверяем, есть ли origin в списке разрешенных
+      if (allowedOrigins.indexOf(origin) !== -1) {
+        console.log('✅ CORS allowed for:', origin);
+        callback(null, true);
+      } else {
+        console.log('🚫 CORS заблокирован для:', origin);
+        console.log('📋 Разрешенные origins:', allowedOrigins);
+        // Для отладки: разрешаем все origins в development
+        if (process.env.NODE_ENV === 'development') {
+          console.log('⚠️ Development mode: allowing origin anyway');
+          callback(null, true);
+        } else {
+          callback(new Error('Not allowed by CORS'));
+        }
+      }
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
     credentials: true
-  }
+  },
+  transports: ['websocket', 'polling'],
+  allowEIO3: true,
+  pingTimeout: 60000, // 60 секунд - время ожидания ответа на ping
+  pingInterval: 25000, // 25 секунд - интервал отправки ping
+  connectTimeout: 45000, // 45 секунд - время ожидания подключения
+  upgradeTimeout: 30000, // 30 секунд - время ожидания апгрейда транспорта
+  allowUpgrades: true, // Разрешить апгрейд транспорта
+  cookie: false, // Отключаем куки для избежания проблем с session ID
+  serveClient: false // Не отдавать клиентскую библиотеку Socket.IO
 });
 
 // Хранилище подключенных пользователей
@@ -47,6 +96,7 @@ io.use(async (socket, next) => {
       if (response.status === 200 && response.data) {
         socket.userId = response.data.id;
         socket.user = response.data;
+        socket.laravelToken = cleanToken;
         
         console.log(`✅ User ${response.data.id} authenticated successfully`);
         return next();
@@ -55,16 +105,37 @@ io.use(async (socket, next) => {
         return next(new Error('Authentication error: Invalid response from API'));
       }
     } catch (apiError) {
-      console.log(`❌ API authentication error: ${apiError.message}`);
+      const statusCode = apiError.response?.status;
+      const errorMessage = apiError.message || 'Unknown error';
+      
+      console.log(`❌ API authentication error: ${errorMessage}`);
+      console.log(`❌ API error details:`, {
+        code: apiError.code,
+        status: statusCode,
+        message: errorMessage
+      });
+      
+      // Если это ошибка сети или таймаут, даем больше информации
+      if (apiError.code === 'ECONNREFUSED' || apiError.code === 'ETIMEDOUT' || apiError.code === 'ENOTFOUND') {
+        console.log('⚠️ Laravel API недоступен:', process.env.LARAVEL_API_URL);
+      }
+      
+      // Если токен невалидный (401/403), отклоняем подключение
+      if (statusCode === 401 || statusCode === 403) {
+        console.log('🚫 Invalid token, rejecting connection');
+        return next(new Error('Authentication error: Invalid token'));
+      }
       
       // Если API недоступен, разрешаем подключение без аутентификации для отладки
       if (process.env.NODE_ENV === 'development') {
         console.log('⚠️ Development mode: allowing connection without authentication');
         socket.userId = 'debug_user';
         socket.user = { id: 'debug_user', name: 'Debug User' };
+        socket.laravelToken = cleanToken;
         return next();
       }
       
+      // В продакшене отклоняем подключение если API недоступен
       return next(new Error('Authentication error: API unavailable'));
     }
   } catch (error) {
@@ -73,9 +144,22 @@ io.use(async (socket, next) => {
   }
 });
 
+// Обработка ошибок подключения
+io.engine.on('connection_error', (err) => {
+  console.error('❌ Socket.IO connection error:', err.req?.url, err.message);
+  if (err.message && err.message.includes('Session ID unknown')) {
+    console.log('⚠️ Session ID unknown error detected, client should reconnect');
+  }
+});
+
 // Обработка подключения
 io.on('connection', (socket) => {
   console.log(`🔌 User ${socket.userId} connected (Socket ID: ${socket.id})`);
+  
+  // Обработка ошибок на уровне сокета
+  socket.on('error', (error) => {
+    console.error(`❌ Socket error for user ${socket.userId}:`, error);
+  });
   
   // Сохраняем информацию о подключенном пользователе
   connectedUsers.set(socket.userId, {
@@ -132,6 +216,102 @@ io.on('connection', (socket) => {
     }
   });
   
+  // Обработка события typing
+  socket.on('typing', (data) => {
+    if (data.chat_id) {
+      console.log(`⌨️ User ${socket.userId} is typing in chat ${data.chat_id}`);
+      console.log('⌨️ Typing data:', {
+        chat_id: data.chat_id,
+        user_id: data.user_id || socket.userId,
+        user_name: data.user_name || socket.user?.name
+      });
+      
+      // Проверяем, есть ли пользователи в комнате
+      const room = io.sockets.adapter.rooms.get(`chat.${data.chat_id}`);
+      console.log(`👥 Users in room chat.${data.chat_id}:`, room ? room.size : 0);
+      
+      // Отправляем событие всем в комнате чата, кроме отправителя
+      socket.to(`chat.${data.chat_id}`).emit('chat:typing', {
+        chat_id: data.chat_id,
+        user_id: data.user_id || socket.userId,
+        user_name: data.user_name || socket.user?.name
+      });
+      
+      console.log(`✅ Typing event sent to room chat.${data.chat_id}`);
+    } else {
+      console.log('❌ Typing event missing chat_id');
+    }
+  });
+  
+  // Обработка события stop_typing
+  socket.on('stop_typing', (data) => {
+    if (data.chat_id) {
+      console.log(`⌨️ User ${socket.userId} stopped typing in chat ${data.chat_id}`);
+      console.log('⌨️ Stop typing data:', {
+        chat_id: data.chat_id,
+        user_id: data.user_id || socket.userId
+      });
+      
+      // Отправляем событие всем в комнате чата, кроме отправителя
+      socket.to(`chat.${data.chat_id}`).emit('chat:stop_typing', {
+        chat_id: data.chat_id,
+        user_id: data.user_id || socket.userId
+      });
+      
+      console.log(`✅ Stop typing event sent to room chat.${data.chat_id}`);
+    } else {
+      console.log('❌ Stop typing event missing chat_id');
+    }
+  });
+
+  // Проксирование «прочитано» в Laravel (как typing — без отдельного HTTP с клиента)
+  socket.on('mark_messages_read', async (data, ack) => {
+    const reply = (payload) => {
+      try {
+        if (typeof ack === 'function') ack(payload);
+      } catch (_) { /* ignore */ }
+    };
+
+    const chatId = data?.chat_id ?? data?.chatId;
+    if (chatId === undefined || chatId === null || String(chatId).trim() === '') {
+      return reply({ ok: false, error: 'chat_id required' });
+    }
+
+    if (!socket.laravelToken) {
+      return reply({ ok: false, error: 'no_token' });
+    }
+
+    const roomName = `chat.${chatId}`;
+    if (!socket.rooms.has(roomName)) {
+      return reply({ ok: false, error: 'not_in_chat_room' });
+    }
+
+    const baseUrl = process.env.LARAVEL_API_URL;
+    if (!baseUrl) {
+      return reply({ ok: false, error: 'laravel_not_configured' });
+    }
+
+    try {
+      await axios.post(
+        `${baseUrl}/api/chats/${chatId}/mark-read`,
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${socket.laravelToken}`,
+            Accept: 'application/json',
+            'Content-Type': 'application/json'
+          },
+          timeout: 15000
+        }
+      );
+      reply({ ok: true });
+    } catch (err) {
+      const status = err.response?.status;
+      console.error(`❌ mark_messages_read proxy failed (chat ${chatId}):`, status, err.message);
+      reply({ ok: false, status, error: err.message || 'proxy_failed' });
+    }
+  });
+  
   // Обработка отключения
   socket.on('disconnect', () => {
     console.log(`🔌 User ${socket.userId} disconnected (Socket ID: ${socket.id})`);
@@ -163,8 +343,32 @@ io.on('connection', (socket) => {
 });
 
 // API endpoints для Laravel
-app.use(cors());
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
 app.use(express.json());
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    connectedUsers: connectedUsers.size,
+    memory: {
+      used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+      rss: Math.round(process.memoryUsage().rss / 1024 / 1024)
+    }
+  });
+});
 
 // Получение списка онлайн пользователей
 app.get('/api/online-users', (req, res) => {
@@ -323,6 +527,15 @@ app.post('/api/posts/broadcast', (req, res) => {
         });
         break;
         
+      case 'post_forwarded':
+        // Отправляем всем пользователям для обновления счетчика пересылок
+        console.log(`📤 Broadcasting post forwarded to all users`);
+        io.to('public').emit('post:forwarded', {
+          post_id: data.post_id,
+          forwards_count: data.forwards_count
+        });
+        break;
+        
       case 'comment_deleted':
         // Отправляем всем пользователям
         console.log(`🗑️ Broadcasting comment deleted to all users`);
@@ -336,14 +549,37 @@ app.post('/api/posts/broadcast', (req, res) => {
       case 'comment_liked':
         // Отправляем всем пользователям
         console.log(`❤️ Broadcasting comment like to all users`);
-        io.to('public').emit('comment:liked', {
+        console.log('📊 Comment like data received:', {
           like_id: data.like_id,
           comment_id: data.comment_id,
           post_id: data.post_id,
           user_id: data.user_id,
           status: data.status,
-          user: data.user
+          reaction_type: data.reaction_type,
+          user: data.user,
+          has_user: !!data.user,
+          user_id_in_user: data.user?.id,
+          user_name_in_user: data.user?.name
         });
+        
+        // Проверяем количество пользователей в комнате public
+        const publicRoom = io.sockets.adapter.rooms.get('public');
+        const publicRoomSize = publicRoom ? publicRoom.size : 0;
+        console.log(`👥 Users in public room: ${publicRoomSize}`);
+        
+        const eventData = {
+          like_id: data.like_id,
+          comment_id: data.comment_id,
+          post_id: data.post_id,
+          user_id: data.user_id,
+          status: data.status,
+          reaction_type: data.reaction_type || 'like',
+          user: data.user || null
+        };
+        
+        console.log('📤 Emitting comment:liked event with data:', eventData);
+        io.to('public').emit('comment:liked', eventData);
+        console.log(`✅ comment:liked event emitted to ${publicRoomSize} users in public room`);
         break;
         
       case 'poll_voted':
@@ -510,8 +746,11 @@ app.post('/api/chats/broadcast', (req, res) => {
           sender_id: data.sender_id,
           content: data.content,
           attachment: data.attachment,
+          attachments: data.attachments || [],
           audio_url: data.audio_url,
           audio_duration: data.audio_duration,
+          video_note_url: data.video_note_url,
+          video_note_duration: data.video_note_duration,
           reply_to: data.reply_to,
           is_forwarded: data.is_forwarded,
           original_sender_id: data.original_sender_id,
@@ -674,6 +913,87 @@ app.post('/api/chats/broadcast', (req, res) => {
         });
         break;
         
+      case 'moderation_chat_message_sent':
+        // Отправляем сообщение в чат модерации
+        console.log(`🛡️ Broadcasting moderation chat message to chat ${data.chat_id}`);
+        console.log('📊 Moderation chat message data:', {
+          message_id: data.message_id,
+          chat_id: data.chat_id,
+          sender_id: data.sender_id,
+          content: data.content,
+          created_at: data.created_at,
+          sender: data.sender,
+          chat: data.chat
+        });
+        
+        // Отправляем в комнату модерации
+        const moderationRoom = io.sockets.adapter.rooms.get(`moderation_chat.${data.chat_id}`);
+        console.log(`👥 Users in room moderation_chat.${data.chat_id}:`, moderationRoom ? moderationRoom.size : 0);
+        
+        // Отправляем событие в комнату модерации
+        io.to(`moderation_chat.${data.chat_id}`).emit('moderation_message_sent', {
+          id: data.message_id,
+          message_id: data.message_id,
+          chat_id: data.chat_id,
+          user_id: data.sender_id,
+          sender_id: data.sender_id,
+          message: data.content,
+          content: data.content,
+          created_at: data.created_at,
+          user: data.sender || {
+            id: data.sender_id,
+            name: data.sender?.name || 'Пользователь',
+            avatar: data.sender?.avatar
+          },
+          chat: data.chat
+        });
+        
+        // Также отправляем пользователю чата и модератору, если они есть
+        if (data.chat) {
+          // Отправляем пользователю чата
+          if (data.chat.user_id) {
+            io.to(`user:${data.chat.user_id}`).emit('moderation_message_sent', {
+              id: data.message_id,
+              message_id: data.message_id,
+              chat_id: data.chat_id,
+              user_id: data.sender_id,
+              sender_id: data.sender_id,
+              message: data.content,
+              content: data.content,
+              created_at: data.created_at,
+              user: data.sender || {
+                id: data.sender_id,
+                name: data.sender?.name || 'Пользователь',
+                avatar: data.sender?.avatar
+              },
+              chat: data.chat
+            });
+          }
+          
+          // Отправляем модератору, если он назначен
+          if (data.chat.moderator_id) {
+            io.to(`user:${data.chat.moderator_id}`).emit('moderation_message_sent', {
+              id: data.message_id,
+              message_id: data.message_id,
+              chat_id: data.chat_id,
+              user_id: data.sender_id,
+              sender_id: data.sender_id,
+              message: data.content,
+              content: data.content,
+              created_at: data.created_at,
+              user: data.sender || {
+                id: data.sender_id,
+                name: data.sender?.name || 'Пользователь',
+                avatar: data.sender?.avatar
+              },
+              chat: data.chat
+            });
+          }
+        }
+        
+        console.log(`✅ Moderation chat message broadcasted to room moderation_chat.${data.chat_id}`);
+        break;
+        
       default:
         console.log(`❌ Unknown chat event type: ${type}`);
         return res.status(400).json({
@@ -716,13 +1036,27 @@ app.post('/api/notifications/broadcast', (req, res) => {
       case 'notification_created':
         // Отправляем конкретному пользователю
         console.log(`🔔 Broadcasting new notification to user ${data.user_id}`);
-        io.to(`user:${data.user_id}`).emit('notification:created', {
+        console.log('🔔 Notification data:', JSON.stringify(data, null, 2));
+        
+        // Проверяем, есть ли пользователь в комнате
+        const userRoom = io.sockets.adapter.rooms.get(`user:${data.user_id}`);
+        const userRoomSize = userRoom ? userRoom.size : 0;
+        console.log(`👥 Users in room user:${data.user_id}: ${userRoomSize}`);
+        
+        const notificationPayload = {
           notification_id: data.notification_id,
           user_id: data.user_id,
           type: data.type,
           data: data.data,
-          created_at: data.created_at
-        });
+          created_at: data.created_at || new Date().toISOString(),
+          updated_at: data.updated_at || new Date().toISOString()
+        };
+        
+        console.log('🔔 Sending notification payload:', JSON.stringify(notificationPayload, null, 2));
+        
+        io.to(`user:${data.user_id}`).emit('notification:created', notificationPayload);
+        
+        console.log(`✅ Notification sent to user:${data.user_id}`);
         break;
         
       case 'notification_read':
@@ -760,6 +1094,94 @@ app.post('/api/notifications/broadcast', (req, res) => {
     
   } catch (error) {
     console.error('❌ Error broadcasting notification event:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// Специальный endpoint для событий историй
+app.post('/api/stories/broadcast', (req, res) => {
+  const { type, data } = req.body;
+  
+  if (!type) {
+    console.log('❌ Stories broadcast request missing type');
+    return res.status(400).json({
+      success: false,
+      message: 'Event type is required'
+    });
+  }
+  
+  console.log(`📸 Stories broadcast request: ${type}`, data);
+  
+  try {
+    switch (type) {
+      case 'story_created':
+        // Отправляем всем пользователям для обновления ленты историй
+        console.log(`📸 Broadcasting new story to all users`);
+        console.log('📊 Story data:', {
+          story_id: data.story?.id,
+          user_id: data.story?.user_id,
+          media_type: data.story?.media_type,
+          has_user: !!data.story?.user
+        });
+        
+        // Проверяем количество пользователей в канале 'public'
+        const publicRoom = io.sockets.adapter.rooms.get('public');
+        const publicRoomSize = publicRoom ? publicRoom.size : 0;
+        console.log(`👥 Users in public room: ${publicRoomSize}`);
+        
+        // Отправляем событие всем пользователям в канале 'public'
+        io.to('public').emit('story:created', {
+          story: data.story
+        });
+        
+        console.log(`✅ Story:created event sent to ${publicRoomSize} users in public room`);
+        break;
+        
+      case 'story_deleted':
+        // Отправляем всем пользователям для обновления ленты
+        console.log(`🗑️ Broadcasting story deleted to all users`);
+        io.to('public').emit('story:deleted', {
+          story_id: data.story_id,
+          user_id: data.user_id
+        });
+        break;
+        
+      case 'story_expired':
+        // Отправляем всем пользователям для обновления ленты
+        console.log(`⏰ Broadcasting story expired to all users`);
+        io.to('public').emit('story:expired', {
+          story_id: data.story_id,
+          user_id: data.user_id
+        });
+        break;
+        
+      case 'stories_feed_updated':
+        // Отправляем всем пользователям для обновления ленты
+        console.log(`🔄 Broadcasting stories feed updated to all users`);
+        io.to('public').emit('stories:feed_updated', {
+          timestamp: data.timestamp
+        });
+        break;
+        
+      default:
+        console.log(`❌ Unknown story event type: ${type}`);
+        return res.status(400).json({
+          success: false,
+          message: 'Unknown event type'
+        });
+    }
+    
+    console.log(`✅ Story event ${type} broadcasted successfully`);
+    res.json({
+      success: true,
+      message: `Story event ${type} broadcasted successfully`
+    });
+    
+  } catch (error) {
+    console.error('❌ Error broadcasting story event:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error'
