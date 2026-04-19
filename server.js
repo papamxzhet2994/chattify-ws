@@ -69,22 +69,33 @@ const io = socketIo(server, {
 const connectedUsers = new Map();
 const userSockets = new Map();
 
+const extractAccessToken = (socket) => {
+  const rawToken =
+    socket.handshake.auth?.token ||
+    socket.handshake.auth?.accessToken ||
+    socket.handshake.headers.authorization;
+
+  if (!rawToken || typeof rawToken !== 'string') {
+    return null;
+  }
+
+  const cleanToken = rawToken.replace(/^Bearer\s+/i, '').trim();
+  return cleanToken.length > 0 ? cleanToken : null;
+};
+
 // Middleware для аутентификации
 io.use(async (socket, next) => {
   try {
-    const token = socket.handshake.auth.token || socket.handshake.headers.authorization;
+    const cleanToken = extractAccessToken(socket);
     
-    if (!token) {
+    if (!cleanToken) {
       console.log('❌ No token provided');
       return next(new Error('Authentication error: No token provided'));
     }
-
-    // Убираем 'Bearer ' если есть
-    const cleanToken = token.replace('Bearer ', '');
     
     // Проверяем токен через Laravel API с увеличенным таймаутом
     try {
-      const response = await axios.get(`${process.env.LARAVEL_API_URL}/api/profile`, {
+      const response = await axios.get(`${process.env.LARAVEL_API_URL}/api/me`, {
         headers: {
           'Authorization': `Bearer ${cleanToken}`,
           'Accept': 'application/json',
