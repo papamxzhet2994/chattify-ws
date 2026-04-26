@@ -69,6 +69,22 @@ const io = socketIo(server, {
 const connectedUsers = new Map();
 const userSockets = new Map();
 
+const normalizeChatMessagePayload = (data = {}) => ({
+  ...data,
+  attachment: data.attachment || null,
+  attachments: data.attachments || [],
+  audio_url: data.audio_url || null,
+  audio_duration: data.audio_duration ?? null,
+  video_note_url: data.video_note_url || null,
+  video_note_duration: data.video_note_duration ?? null,
+  recipient_keys: data.recipient_keys || [],
+  encrypted_payload: data.encrypted_payload || null,
+  reply_to_message: data.reply_to_message || null,
+  original_sender: data.original_sender || null,
+  post: data.post || null,
+  is_end_to_end_encrypted: !!data.is_end_to_end_encrypted,
+});
+
 const extractAccessToken = (socket) => {
   const rawToken =
     socket.handshake.auth?.token ||
@@ -731,6 +747,8 @@ app.post('/api/chats/broadcast', (req, res) => {
   try {
     switch (type) {
       case 'chat_message_sent':
+        const messagePayload = normalizeChatMessagePayload(data);
+
         // Отправляем в конкретный чат
         console.log(`💬 Broadcasting new message to chat ${data.chat_id}`);
         console.log('📊 Chat message data:', {
@@ -738,6 +756,7 @@ app.post('/api/chats/broadcast', (req, res) => {
           chat_id: data.chat_id,
           sender_id: data.sender_id,
           content: data.content,
+          is_end_to_end_encrypted: !!data.is_end_to_end_encrypted,
           attachment: data.attachment,
           reply_to: data.reply_to,
           is_forwarded: data.is_forwarded,
@@ -751,39 +770,17 @@ app.post('/api/chats/broadcast', (req, res) => {
         const room = io.sockets.adapter.rooms.get(`chat.${data.chat_id}`);
         console.log(`👥 Users in room chat.${data.chat_id}:`, room ? room.size : 0);
         
-        io.to(`chat.${data.chat_id}`).emit('chat:message_sent', {
-          message_id: data.message_id,
-          chat_id: data.chat_id,
-          sender_id: data.sender_id,
-          content: data.content,
-          attachment: data.attachment,
-          attachments: data.attachments || [],
-          audio_url: data.audio_url,
-          audio_duration: data.audio_duration,
-          video_note_url: data.video_note_url,
-          video_note_duration: data.video_note_duration,
-          reply_to: data.reply_to,
-          is_forwarded: data.is_forwarded,
-          original_sender_id: data.original_sender_id,
-          created_at: data.created_at,
-          updated_at: data.updated_at,
-          sender: data.sender
-        });
+        io.to(`chat.${data.chat_id}`).emit('chat:message_sent', messagePayload);
         
         console.log(`✅ Message broadcasted to room chat.${data.chat_id}`);
         break;
         
       case 'chat_message_edited':
+        const editedMessagePayload = normalizeChatMessagePayload(data);
+
         // Отправляем в конкретный чат
         console.log(`✏️ Broadcasting message edited to chat ${data.chat_id}`);
-        io.to(`chat.${data.chat_id}`).emit('chat:message_edited', {
-          message_id: data.message_id,
-          chat_id: data.chat_id,
-          sender_id: data.sender_id,
-          content: data.content,
-          updated_at: data.updated_at,
-          is_edited: data.is_edited
-        });
+        io.to(`chat.${data.chat_id}`).emit('chat:message_edited', editedMessagePayload);
         break;
         
       case 'chat_message_deleted':

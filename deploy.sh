@@ -107,14 +107,13 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()
   process.env.CORS_ORIGIN?.split(',').map(o => o.trim()) || [
     'https://chattify.site',
     'https://www.chattify.site',
-    'https://api.chattify.site',
-    'https://www.api.chattify.site',
+    'https://chattify.space',
+    'https://www.chattify.space',
     'https://ws.chattify.site',
     'http://localhost:3000',
     'http://localhost:3001'
   ];
 
-// Добавляем все возможные варианты origins для отладки
 console.log('🔗 Разрешенные домены для CORS:', allowedOrigins);
 
 const io = socketIo(server, {
@@ -163,22 +162,49 @@ const io = socketIo(server, {
 const connectedUsers = new Map();
 const userSockets = new Map();
 
+const normalizeChatMessagePayload = (data = {}) => ({
+  ...data,
+  attachment: data.attachment || null,
+  attachments: data.attachments || [],
+  audio_url: data.audio_url || null,
+  audio_duration: data.audio_duration ?? null,
+  video_note_url: data.video_note_url || null,
+  video_note_duration: data.video_note_duration ?? null,
+  recipient_keys: data.recipient_keys || [],
+  encrypted_payload: data.encrypted_payload || null,
+  reply_to_message: data.reply_to_message || null,
+  original_sender: data.original_sender || null,
+  post: data.post || null,
+  is_end_to_end_encrypted: !!data.is_end_to_end_encrypted,
+});
+
+const extractAccessToken = (socket) => {
+  const rawToken =
+    socket.handshake.auth?.token ||
+    socket.handshake.auth?.accessToken ||
+    socket.handshake.headers.authorization;
+
+  if (!rawToken || typeof rawToken !== 'string') {
+    return null;
+  }
+
+  const cleanToken = rawToken.replace(/^Bearer\s+/i, '').trim();
+  return cleanToken.length > 0 ? cleanToken : null;
+};
+
 // Middleware для аутентификации
 io.use(async (socket, next) => {
   try {
-    const token = socket.handshake.auth.token || socket.handshake.headers.authorization;
+    const cleanToken = extractAccessToken(socket);
     
-    if (!token) {
+    if (!cleanToken) {
       console.log('❌ No token provided');
       return next(new Error('Authentication error: No token provided'));
     }
-
-    // Убираем 'Bearer ' если есть
-    const cleanToken = token.replace('Bearer ', '');
     
     // Проверяем токен через Laravel API с увеличенным таймаутом
     try {
-      const response = await axios.get(`${process.env.LARAVEL_API_URL}/api/profile`, {
+      const response = await axios.get(`${process.env.LARAVEL_API_URL}/api/me`, {
         headers: {
           'Authorization': `Bearer ${cleanToken}`,
           'Accept': 'application/json',
@@ -244,34 +270,6 @@ io.engine.on('connection_error', (err) => {
   if (err.message && err.message.includes('Session ID unknown')) {
     console.log('⚠️ Session ID unknown error detected, client should reconnect');
   }
-});
-
-// API endpoints для Laravel
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
-  credentials: true
-}));
-app.use(express.json());
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    connectedUsers: connectedUsers.size,
-    memory: {
-      used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-      total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
-      rss: Math.round(process.memoryUsage().rss / 1024 / 1024)
-    }
-  });
 });
 
 // Обработка подключения
@@ -461,6 +459,34 @@ io.on('connection', (socket) => {
     }
     
     console.log(`👥 Total connected users: ${connectedUsers.size}`);
+  });
+});
+
+// API endpoints для Laravel
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
+app.use(express.json());
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    connectedUsers: connectedUsers.size,
+    memory: {
+      used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+      rss: Math.round(process.memoryUsage().rss / 1024 / 1024)
+    }
   });
 });
 
@@ -814,6 +840,8 @@ app.post('/api/chats/broadcast', (req, res) => {
   try {
     switch (type) {
       case 'chat_message_sent':
+        const messagePayload = normalizeChatMessagePayload(data);
+
         // Отправляем в конкретный чат
         console.log(`💬 Broadcasting new message to chat ${data.chat_id}`);
         console.log('📊 Chat message data:', {
@@ -821,6 +849,7 @@ app.post('/api/chats/broadcast', (req, res) => {
           chat_id: data.chat_id,
           sender_id: data.sender_id,
           content: data.content,
+          is_end_to_end_encrypted: !!data.is_end_to_end_encrypted,
           attachment: data.attachment,
           reply_to: data.reply_to,
           is_forwarded: data.is_forwarded,
@@ -834,39 +863,17 @@ app.post('/api/chats/broadcast', (req, res) => {
         const room = io.sockets.adapter.rooms.get(`chat.${data.chat_id}`);
         console.log(`👥 Users in room chat.${data.chat_id}:`, room ? room.size : 0);
         
-        io.to(`chat.${data.chat_id}`).emit('chat:message_sent', {
-          message_id: data.message_id,
-          chat_id: data.chat_id,
-          sender_id: data.sender_id,
-          content: data.content,
-          attachment: data.attachment,
-          attachments: data.attachments || [],
-          audio_url: data.audio_url,
-          audio_duration: data.audio_duration,
-          video_note_url: data.video_note_url,
-          video_note_duration: data.video_note_duration,
-          reply_to: data.reply_to,
-          is_forwarded: data.is_forwarded,
-          original_sender_id: data.original_sender_id,
-          created_at: data.created_at,
-          updated_at: data.updated_at,
-          sender: data.sender
-        });
+        io.to(`chat.${data.chat_id}`).emit('chat:message_sent', messagePayload);
         
         console.log(`✅ Message broadcasted to room chat.${data.chat_id}`);
         break;
         
       case 'chat_message_edited':
+        const editedMessagePayload = normalizeChatMessagePayload(data);
+
         // Отправляем в конкретный чат
         console.log(`✏️ Broadcasting message edited to chat ${data.chat_id}`);
-        io.to(`chat.${data.chat_id}`).emit('chat:message_edited', {
-          message_id: data.message_id,
-          chat_id: data.chat_id,
-          sender_id: data.sender_id,
-          content: data.content,
-          updated_at: data.updated_at,
-          is_edited: data.is_edited
-        });
+        io.to(`chat.${data.chat_id}`).emit('chat:message_edited', editedMessagePayload);
         break;
         
       case 'chat_message_deleted':
@@ -1299,7 +1306,7 @@ process.on('SIGTERM', () => {
   server.close(() => {
     console.log('✅ Process terminated');
   });
-});
+}); 
 SERVER_EOF
 
 # Устанавливаем зависимости
